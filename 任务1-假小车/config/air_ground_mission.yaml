@@ -255,9 +255,9 @@ car_udp:
   # a_x/a_y 是 A 点相对 H 点的 Faster-LIO 坐标；ab_yaw 是 A->B 的方向。
   track:
     enabled: true
-    a_x_m: 1.25                    # 必须现场标定
-    a_y_m: 0.75                    # 必须现场标定
-    ab_yaw_deg: 90.0               # 必须现场标定
+    a_x_m: 0.375
+    a_y_m: 0.875
+    ab_yaw_deg: 90.0
     straight_length_m: 1.50
     radius_m: 0.75
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""陆空协同无人机 UDP V1.1 网关。
+"""陆空协同无人机 UDP V1.2/V1.1 实飞安全网关。
 
 统一绑定 UAV:8888，处理：
 - GS -> UAV: CMD:PING/STATUS/BOOT/LAND/RESET
@@ -14,6 +14,8 @@ ROS 内部 /car/state 使用相对 H 点的 MAVROS local 坐标（m）。
 
 from collections import OrderedDict
 import json
+import queue
+import re
 import math
 import os
 import socket
@@ -22,11 +24,15 @@ import time
 
 import rospy
 import yaml
+from geometry_msgs.msg import PoseStamped
+from mavros_msgs.msg import State
 from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Bool, String
 
 
 VALID_SEGMENTS = {"AB", "BC", "CD", "DA", "UNKNOWN"}
+CMD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
 
 
 def clamp(value, low, high):
@@ -191,9 +197,17 @@ class UavUdpGateway:
         )
         self.strict_source_ip = bool(
             rospy.get_param(
-                "~strict_source_ip", bool(pcfg.get("strict_source_ip", True))
+                "~strict_source_ip", bool(pcfg.get("strict_source_ip", False))
             )
         )
+        # DHCP 场景默认不要求预先配置地面站 IP。关闭严格来源校验后，
+        # 第一个合法的地面站控制命令会更新后续 HB/TEL/EVT 的目标 IP。
+        self.learn_ground_station_ip = bool(
+            rospy.get_param("~learn_ground_station_ip", not self.strict_source_ip)
+        )
+        self.gs_addr_learned = bool(self.strict_source_ip)
+        self.gs_addr_lock = threading.Lock()
+
         self.allow_gs_direct_start = bool(
             rospy.get_param(
                 "~allow_gs_direct_start",
@@ -204,9 +218,29 @@ class UavUdpGateway:
             rospy.get_param("~car_telemetry_enabled", True)
         )
         self.forced_task = normalize_task(rospy.get_param("~forced_task", ""))
-        self.allow_legacy = bool(pcfg.get("allow_legacy_format", True))
-        self.command_result_timeout = safe_float(
-            rcfg.get("command_result_timeout_s", 0.22), 0.22
+        self.allow_legacy = bool(
+            rospy.get_param(
+                "~allow_legacy_format", bool(pcfg.get("allow_legacy_format", True))
+            )
+        )
+        self.command_result_timeout = max(
+            0.20,
+            safe_float(
+                rospy.get_param(
+                    "~command_result_timeout_s",
+                    rcfg.get("command_result_timeout_s", 0.80),
+                ),
+                0.80,
+            ),
+        )
+        self.status_max_age_s = max(
+            0.20, safe_float(rospy.get_param("~status_max_age_s", 0.80), 0.80)
+        )
+        self.start_pose_max_age_s = max(
+            0.10, safe_float(rospy.get_param("~start_pose_max_age_s", 0.30), 0.30)
+        )
+        self.max_packet_bytes = max(
+            256, min(65507, safe_int(rospy.get_param("~max_packet_bytes", 4096), 4096))
         )
         self.dedup_limit = max(8, safe_int(rcfg.get("dedup_cache_size", 32), 32))
         self.event_repeat = max(1, safe_int(rcfg.get("event_repeat", 3), 3))
@@ -234,21 +268,12 @@ class UavUdpGateway:
         self.land_pub = rospy.Publisher("/uav/land", Bool, queue_size=10)
         self.reset_pub = rospy.Publisher("/uav/reset", Bool, queue_size=10)
 
-        rospy.Subscriber("/uav/mission_status", String, self.status_cb, queue_size=30)
-        rospy.Subscriber("/uav/mission_event", String, self.event_cb, queue_size=30)
-        rospy.Subscriber(
-            "/uav/mission_command_result", String, self.command_result_cb, queue_size=20
-        )
-        rospy.Subscriber("/mavros/battery", BatteryState, self.battery_cb, queue_size=10)
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((self.listen_ip, self.listen_port))
-        self.sock.settimeout(0.05)
-        rospy.on_shutdown(self.shutdown)
-
+        # 状态字段必须在创建订阅者前初始化，避免回调抢先触发。
         self.latest_status = {}
         self.latest_status_rx = 0.0
+        self.latest_fcu_state = State()
+        self.latest_fcu_state_rx = 0.0
+        self.latest_pose_rx = 0.0
         self.battery_percent = -1
         self.boot_task = ""
         self.boot_state = "STOPPED"
@@ -262,26 +287,70 @@ class UavUdpGateway:
         self.dedup = OrderedDict()
         self.result_condition = threading.Condition()
         self.command_results = {}
+        self.event_queue = queue.Queue(maxsize=128)
+        self.event_stop = threading.Event()
 
+        rospy.Subscriber("/uav/mission_status", String, self.status_cb, queue_size=30)
+        rospy.Subscriber("/uav/mission_event", String, self.event_cb, queue_size=30)
+        rospy.Subscriber(
+            "/uav/mission_command_result", String, self.command_result_cb, queue_size=20
+        )
+        rospy.Subscriber("/mavros/state", State, self.fcu_state_cb, queue_size=20)
+        rospy.Subscriber(
+            "/mavros/local_position/pose", PoseStamped, self.pose_cb, queue_size=30
+        )
+        rospy.Subscriber("/mavros/battery", BatteryState, self.battery_cb, queue_size=10)
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+        self.sock.bind((self.listen_ip, self.listen_port))
+        self.sock.settimeout(0.03)
+        self.event_thread = threading.Thread(
+            target=self.event_sender_loop,
+            name="uav_udp_event_sender",
+            daemon=True,
+        )
+        self.event_thread.start()
+        rospy.on_shutdown(self.shutdown)
+
+        gs_mode = (
+            "FIXED {}:{}".format(self.gs_addr[0], self.gs_addr[1])
+            if self.strict_source_ip
+            else "DYNAMIC (learn from first valid GS command, reply port {})".format(
+                self.gs_addr[1]
+            )
+        )
         rospy.logwarn(
-            "UDP V%s gateway listening %s:%d, GS=%s:%d, CAR=%s, "
-            "GS_DIRECT_START=%s, CAR_TELEMETRY=%s, FORCED_TASK=%s",
+            "UDP V%s gateway listening %s:%d, GS=%s, CAR=%s, "
+            "STRICT_SOURCE_IP=%s, GS_DIRECT_START=%s, CAR_TELEMETRY=%s, "
+            "FORCED_TASK=%s, POSE_MAX_AGE=%.2fs, STATUS_MAX_AGE=%.2fs",
             self.proto,
             self.listen_ip,
             self.listen_port,
-            self.gs_addr[0],
-            self.gs_addr[1],
+            gs_mode,
             self.car_ip,
+            self.strict_source_ip,
             self.allow_gs_direct_start,
             self.car_telemetry_enabled,
             self.forced_task or "ANY",
+            self.start_pose_max_age_s,
+            self.status_max_age_s,
         )
 
     def shutdown(self):
+        self.event_stop.set()
         try:
             self.sock.close()
         except Exception:
             pass
+
+    def fcu_state_cb(self, msg):
+        self.latest_fcu_state = msg
+        self.latest_fcu_state_rx = time.monotonic()
+
+    def pose_cb(self, _msg):
+        self.latest_pose_rx = time.monotonic()
 
     def status_cb(self, msg):
         try:
@@ -330,25 +399,85 @@ class UavUdpGateway:
         self.send_event(packet)
 
     def send_event(self, packet):
-        encoded = packet.encode("utf-8")
-        for index in range(self.event_repeat):
+        """关键事件进入独立发送队列，绝不阻塞 LAND 等命令接收。"""
+        try:
+            self.event_queue.put_nowait(str(packet))
+        except queue.Full:
+            rospy.logerr_throttle(1.0, "UDP event queue full; drop event: %s", packet)
+
+    def event_sender_loop(self):
+        while not self.event_stop.is_set() and not rospy.is_shutdown():
             try:
-                self.sock.sendto(encoded, self.gs_addr)
-            except OSError as exc:
-                rospy.logwarn_throttle(1.0, "UDP event send failed: %s", str(exc))
-                break
-            if index + 1 < self.event_repeat:
-                time.sleep(self.event_repeat_interval)
+                packet = self.event_queue.get(timeout=0.10)
+            except queue.Empty:
+                continue
+            encoded = packet.encode("utf-8")
+            for index in range(self.event_repeat):
+                if self.event_stop.is_set() or rospy.is_shutdown():
+                    break
+                target = self.get_ground_station_addr()
+                if target is None:
+                    rospy.logwarn_throttle(
+                        2.0,
+                        "No ground station learned yet; event postponed/dropped: %s",
+                        packet,
+                    )
+                    break
+                try:
+                    self.sock.sendto(encoded, target)
+                except OSError as exc:
+                    if not rospy.is_shutdown():
+                        rospy.logwarn_throttle(1.0, "UDP event send failed: %s", str(exc))
+                    break
+                if index + 1 < self.event_repeat:
+                    self.event_stop.wait(self.event_repeat_interval)
+            self.event_queue.task_done()
+
+    def publish_land_burst(self):
+        """异步重复发布 LAND，降低 ROS 单帧在节点重连瞬间丢失的概率。"""
+        for index in range(3):
+            if rospy.is_shutdown():
+                return
+            self.land_pub.publish(Bool(data=True))
+            if index < 2:
+                time.sleep(0.05)
+
+    def get_ground_station_addr(self):
+        """返回当前地面站遥测目标；动态模式尚未学习时返回 None。"""
+        with self.gs_addr_lock:
+            if not self.gs_addr_learned and not self.strict_source_ip:
+                return None
+            return self.gs_addr
+
+    def learn_ground_station(self, addr, action):
+        """从合法 GS 控制命令动态学习 IP，端口仍使用协议约定的 8889。"""
+        if self.strict_source_ip or not self.learn_ground_station_ip:
+            return
+        if action not in {"PING", "STATUS", "BOOT", "LAND", "RESET", "START"}:
+            return
+        learned = (str(addr[0]), int(self.gs_addr[1]))
+        with self.gs_addr_lock:
+            changed = (not self.gs_addr_learned) or learned != self.gs_addr
+            old = self.gs_addr
+            self.gs_addr = learned
+            self.gs_addr_learned = True
+        if changed:
+            rospy.logwarn(
+                "Ground station IP learned/updated: %s:%d -> %s:%d (action=%s)",
+                old[0], old[1], learned[0], learned[1], action,
+            )
 
     def source_role(self, addr):
-        ip = addr[0]
-        if ip == self.gs_addr[0]:
-            return "GS"
+        ip = str(addr[0])
         if ip == self.car_ip:
             return "CAR"
-        if not self.strict_source_ip and ip in {"127.0.0.1", "localhost"}:
+        if ip in {"127.0.0.1", "localhost"}:
             return "DEBUG"
-        return "UNKNOWN"
+        if self.strict_source_ip:
+            return "GS" if ip == self.gs_addr[0] else "UNKNOWN"
+        # DHCP 模式：任何非小车来源的合法控制报文均按 GS 处理；
+        # 命令格式、任务状态、FCU/定位新鲜度仍会继续校验。
+        return "GS"
 
     def send_text(self, text, addr):
         try:
@@ -377,7 +506,11 @@ class UavUdpGateway:
     def parse_command(self, text):
         parts = text.strip().split(":")
         if len(parts) >= 3 and parts[0].upper() == "CMD":
-            return parts[1], parts[2].upper(), parts[3:], False
+            cmd_id = parts[1].strip()
+            action = parts[2].strip().upper()
+            if not CMD_ID_RE.fullmatch(cmd_id) or not action:
+                return None
+            return cmd_id, action, parts[3:], False
         if self.allow_legacy and len(parts) == 2 and parts[0].upper() == "CMD":
             legacy_id = "L{:06d}".format(int(time.monotonic() * 1000) % 1000000)
             return legacy_id, parts[1].upper(), [], True
@@ -393,17 +526,49 @@ class UavUdpGateway:
                 self.result_condition.wait(remaining)
             return self.command_results.pop(cmd_id, None)
 
+    def status_fresh(self):
+        return bool(self.latest_status) and (
+            time.monotonic() - self.latest_status_rx <= self.status_max_age_s
+        )
+
+    def pose_fresh(self):
+        return self.latest_pose_rx > 0.0 and (
+            time.monotonic() - self.latest_pose_rx <= self.start_pose_max_age_s
+        )
+
+    def fcu_connected(self):
+        return bool(self.latest_fcu_state.connected) and (
+            time.monotonic() - self.latest_fcu_state_rx <= self.status_max_age_s
+        )
+
+    def fsm_state(self):
+        return str(self.latest_status.get("fsm_state", ""))
+
+    def mission_already_active(self, run_id, task):
+        if not self.status_fresh():
+            return False
+        state = self.fsm_state()
+        if state in {"", "WAIT_START", "WAIT_RESET"}:
+            return False
+        status_run = str(self.latest_status.get("run_id", ""))
+        mission_type = str(self.latest_status.get("mission_type", ""))
+        status_task = "T2" if mission_type == "dynamic_land" else "T1"
+        return status_run == str(run_id) and status_task == normalize_task(task)
+
     def boot_ready(self):
         status = self.latest_status
-        if not status or time.monotonic() - self.latest_status_rx > 1.0:
-            return False
         mavros = status.get("mavros", {})
         home = status.get("home", {})
         state = str(status.get("fsm_state", ""))
         return (
-            bool(mavros.get("connected", False))
+            self.status_fresh()
+            and self.pose_fresh()
+            and self.fcu_connected()
+            and not bool(self.latest_fcu_state.armed)
+            and bool(mavros.get("connected", False))
             and home.get("x") is not None
             and home.get("y") is not None
+            and home.get("z") is not None
             and state == "WAIT_START"
         )
 
@@ -419,14 +584,18 @@ class UavUdpGateway:
     def handle_command(self, text, addr):
         parsed = self.parse_command(text)
         if parsed is None:
+            self.send_text("ERR:0000:UNKNOWN:BAD_FORMAT", addr)
             return
         cmd_id, action, args, legacy = parsed
         role = self.source_role(addr)
+        if role in {"GS", "DEBUG"}:
+            self.learn_ground_station(addr, action)
         key = (addr[0], cmd_id, action)
         if key in self.dedup:
             self.send_text(self.dedup[key], addr)
             return
 
+        cacheable = True
         if self.strict_source_ip and role == "UNKNOWN":
             reply = self.err(cmd_id, action, "UNKNOWN_CMD", "SOURCE_NOT_ALLOWED")
         elif action == "PING":
@@ -445,7 +614,7 @@ class UavUdpGateway:
                     reply = self.err(
                         cmd_id, action, "MODE_MISMATCH", "FORCED_{}".format(self.forced_task)
                     )
-                elif self.latest_status.get("mavros", {}).get("armed", False):
+                elif self.latest_fcu_state.armed:
                     reply = self.err(cmd_id, action, "BUSY", "ARMED")
                 else:
                     self.boot_task = task
@@ -460,18 +629,34 @@ class UavUdpGateway:
             if not allowed:
                 reply = self.err(cmd_id, action, "UNKNOWN_CMD", "SOURCE_NOT_ALLOWED")
             else:
-                run_id = str(args[0]) if len(args) >= 1 else "R000"
+                run_id = str(args[0]).strip() if len(args) >= 1 else "R000"
                 task = normalize_task(args[1] if len(args) >= 2 else self.boot_task)
-                if not task:
+                if not RUN_ID_RE.fullmatch(run_id):
+                    reply = self.err(cmd_id, action, "BAD_FORMAT", "BAD_RUN_ID")
+                elif not task:
                     reply = self.err(cmd_id, action, "BAD_TASK")
                 elif self.forced_task and task != self.forced_task:
                     reply = self.err(
                         cmd_id, action, "MODE_MISMATCH", "FORCED_{}".format(self.forced_task)
                     )
+                elif self.mission_already_active(run_id, task):
+                    # ACK 丢失后的重发：任务已经按同一 run_id 启动，不再重复触发。
+                    self.run_id = run_id
+                    reply = self.ack(cmd_id, action, "OK", run_id)
+                elif self.latest_fcu_state.armed:
+                    reply = self.err(cmd_id, action, "ALREADY_RUNNING", self.fsm_state())
+                elif not self.fcu_connected():
+                    reply = self.err(cmd_id, action, "FCU_DISCONNECTED")
+                elif not self.status_fresh():
+                    reply = self.err(cmd_id, action, "NOT_READY", "STALE_FSM_STATUS")
+                elif not self.pose_fresh():
+                    reply = self.err(cmd_id, action, "NOT_READY", "STALE_LOCAL_POSITION")
                 elif self.boot_state != "READY":
                     reply = self.err(cmd_id, action, "NOT_READY", "BOOT")
                 elif self.boot_task and task != self.boot_task:
                     reply = self.err(cmd_id, action, "MODE_MISMATCH")
+                elif self.fsm_state() != "WAIT_START":
+                    reply = self.err(cmd_id, action, "NOT_READY", self.fsm_state() or "FSM")
                 else:
                     command = {
                         "action": "START",
@@ -486,7 +671,16 @@ class UavUdpGateway:
                     )
                     result = self.wait_command_result(cmd_id)
                     if result is None:
-                        reply = self.err(cmd_id, action, "NOT_READY", "FSM_NO_REPLY")
+                        # 不缓存不确定结果。若 FSM 稍后已启动，重发会由
+                        # mission_already_active() 返回同一 run_id 的 ACK。
+                        cacheable = False
+                        if self.mission_already_active(run_id, task):
+                            self.run_id = run_id
+                            self.run_start_monotonic = time.monotonic()
+                            reply = self.ack(cmd_id, action, "OK", run_id)
+                            cacheable = True
+                        else:
+                            reply = self.err(cmd_id, action, "NOT_READY", "FSM_NO_REPLY")
                     elif bool(result.get("ok", False)):
                         self.run_id = run_id
                         self.run_start_monotonic = time.monotonic()
@@ -502,26 +696,43 @@ class UavUdpGateway:
             if role not in {"GS", "DEBUG"}:
                 reply = self.err(cmd_id, action, "UNKNOWN_CMD", "SOURCE_NOT_ALLOWED")
             else:
-                run_id = str(args[0]) if args else self.run_id
-                reply = self.ack(cmd_id, action, "ACCEPTED", run_id)
-                self.land_pub.publish(Bool(data=True))
-                self.send_event("EVT:UAV_ABORTING:{}".format(run_id))
+                run_id = str(args[0]).strip() if args else self.run_id
+                if not RUN_ID_RE.fullmatch(run_id):
+                    reply = self.err(cmd_id, action, "BAD_FORMAT", "BAD_RUN_ID")
+                else:
+                    # 紧急命令先 ACK，再触发 ROS，避免事件重发拖慢确认。
+                    reply = self.ack(cmd_id, action, "ACCEPTED", run_id)
+                    self.cache_reply(key, reply)
+                    self.send_text(reply, addr)
+                    threading.Thread(
+                        target=self.publish_land_burst,
+                        name="uav_udp_land_burst",
+                        daemon=True,
+                    ).start()
+                    self.send_event("EVT:UAV_ABORTING:{}".format(run_id))
+                    rospy.logerr("UDP LAND accepted from %s for %s", addr[0], run_id)
+                    return
         elif action == "RESET":
             if role not in {"GS", "DEBUG"}:
                 reply = self.err(cmd_id, action, "UNKNOWN_CMD", "SOURCE_NOT_ALLOWED")
-            elif bool(self.latest_status.get("mavros", {}).get("armed", False)):
+            elif self.latest_fcu_state.armed:
                 reply = self.err(cmd_id, action, "BUSY", "ARMED")
+            elif self.fsm_state() not in {"WAIT_START", "WAIT_RESET", "WAIT_FCU"}:
+                reply = self.err(cmd_id, action, "BUSY", self.fsm_state() or "FSM")
             else:
                 self.reset_pub.publish(Bool(data=True))
                 self.run_id = "R000"
                 self.run_start_monotonic = None
+                self.boot_state = "STARTING" if self.boot_task else "STOPPED"
+                self.boot_ready_sent = False
                 reply = self.ack(cmd_id, action, "ACCEPTED")
         elif action == "STOP_NODES":
             reply = self.err(cmd_id, action, "UNKNOWN_CMD", "DISABLED_IN_FLIGHT_BUILD")
         else:
             reply = self.err(cmd_id, action, "UNKNOWN_CMD")
 
-        self.cache_reply(key, reply)
+        if cacheable:
+            self.cache_reply(key, reply)
         self.send_text(reply, addr)
 
     def parse_car_telemetry(self, text, addr):
@@ -638,7 +849,9 @@ class UavUdpGateway:
             return
         self.car_event_pub.publish(String(data=text))
         # 地面站即使没有直接收到小车事件，也能从无人机转发链看到一次。
-        self.send_text(text, self.gs_addr)
+        target = self.get_ground_station_addr()
+        if target is not None:
+            self.send_text(text, target)
 
     @staticmethod
     def map_public_state(status):
@@ -749,7 +962,9 @@ class UavUdpGateway:
         packet = "TEL:UAV:" + json.dumps(
             payload, ensure_ascii=False, separators=(",", ":")
         )
-        self.send_text(packet, target or self.gs_addr)
+        destination = target or self.get_ground_station_addr()
+        if destination is not None:
+            self.send_text(packet, destination)
 
     def send_heartbeat(self):
         now = time.monotonic()
@@ -758,7 +973,9 @@ class UavUdpGateway:
         self.last_hb = now
         self.hb_seq += 1
         state = self.map_public_state(self.latest_status) if self.latest_status else self.boot_state
-        self.send_text("HB:UAV:{}:{}".format(self.hb_seq, state), self.gs_addr)
+        target = self.get_ground_station_addr()
+        if target is not None:
+            self.send_text("HB:UAV:{}:{}".format(self.hb_seq, state), target)
 
     def process_packet(self, text, addr):
         if text.startswith("CMD:"):
@@ -778,7 +995,10 @@ class UavUdpGateway:
     def spin(self):
         while not rospy.is_shutdown():
             try:
-                raw, addr = self.sock.recvfrom(65535)
+                raw, addr = self.sock.recvfrom(self.max_packet_bytes + 1)
+                if len(raw) > self.max_packet_bytes:
+                    self.send_text("ERR:0000:UNKNOWN:BAD_FORMAT:PACKET_TOO_LARGE", addr)
+                    continue
                 text = raw.decode("utf-8", errors="replace").strip()
                 if text:
                     self.process_packet(text, addr)

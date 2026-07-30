@@ -11,7 +11,7 @@ mission:
   status_rate_hz: 10.0
 
   takeoff:
-    cruise_height_m: 1.50            # 相对 H 点地面的巡航高度
+    cruise_height_m: 1.20            # 相对 H 点地面的巡航高度
     yaw_deg: 0.0                    # 全任务固定航向；跟随和半圆伴飞均不使用小车 yaw
     xy_tolerance_m: 0.18
     z_tolerance_m: 0.10
@@ -255,9 +255,9 @@ car_udp:
   # a_x/a_y 是 A 点相对 H 点的 Faster-LIO 坐标；ab_yaw 是 A->B 的方向。
   track:
     enabled: true
-    a_x_m: 1.25                    # 必须现场标定
-    a_y_m: 0.75                    # 必须现场标定
-    ab_yaw_deg: 90.0               # 必须现场标定
+    a_x_m: 0.375
+    a_y_m: 0.875
+    ab_yaw_deg: 90.0
     straight_length_m: 1.50
     radius_m: 0.75
 

@@ -1,0 +1,137 @@
+<launch>
+  <!--
+    任务二受控实飞测试：真实无人机 + 虚拟小车；仅测试起飞、截获、伴飞与安全返航。
+    注意：这不是最终真车/真视觉动态着陆比赛 launch。
+
+    本文件直接复用已验证 stage1_real_flight.launch 的三条真实飞行启动入口，
+    不再嵌套 include d26_real_flight.launch，便于排除基础 launch 版本不一致。
+  -->
+
+  <!-- 真实飞行基础链路 -->
+  <arg name="start_mavros" default="true" />
+  <arg name="start_livox" default="true" />
+  <arg name="start_faster_lio" default="true" />
+
+  <arg name="fcu_url" default="/dev/ttyTHS0:921600" />
+  <arg name="gcs_url" default="" />
+  <arg name="tgt_system" default="1" />
+  <arg name="tgt_component" default="1" />
+
+  <!-- 任务参数 -->
+  <arg name="mission_yaml"
+       default="$(find d26_air_ground_uav)/config/air_ground_mission.yaml" />
+
+  <!-- UDP V1.2/V1.1 实飞控制网关 -->
+  <arg name="start_udp_gateway" default="true" />
+  <arg name="uav_listen_ip" default="0.0.0.0" />
+  <arg name="uav_listen_port" default="8888" />
+  <!-- DHCP 模式不需要预先知道地面站 IP；该 IP 仅在 strict_source_ip=true 时使用。 -->
+  <arg name="ground_station_ip" default="0.0.0.0" />
+  <arg name="ground_station_port" default="8889" />
+  <arg name="car_ip" default="192.168.151.103" />
+  <!-- 当前文件是虚拟小车任务二测试，因此允许 GS 直接 START。正式真车协同时改为 false。 -->
+  <arg name="allow_gs_direct_start" default="true" />
+  <!-- 默认关闭固定来源 IP 校验，并从地面站第一条合法命令动态学习其 IP。 -->
+  <arg name="strict_source_ip" default="false" />
+  <arg name="learn_ground_station_ip" default="true" />
+  <arg name="allow_legacy_format" default="false" />
+
+  <!-- 虚拟小车参数 -->
+  <arg name="car_speed_ab" default="0.08" />
+  <arg name="car_speed_bc" default="0.06" />
+  <arg name="car_speed_cd" default="0.08" />
+  <arg name="car_speed_da" default="0.06" />
+  <arg name="car_telemetry_rate_hz" default="30.0" />
+  <arg name="car_update_rate_hz" default="100.0" />
+  <arg name="start_path_s" default="0.0" />
+  <arg name="max_fake_vision_range_m" default="6.0" />
+
+  <!-- 与已验证 stage1_real_flight.launch 完全相同的 MAVROS 启动方式 -->
+  <include if="$(arg start_mavros)"
+           file="$(find mavros)/launch/px4.launch">
+    <arg name="fcu_url" value="$(arg fcu_url)" />
+    <arg name="gcs_url" value="$(arg gcs_url)" />
+    <arg name="tgt_system" value="$(arg tgt_system)" />
+    <arg name="tgt_component" value="$(arg tgt_component)" />
+  </include>
+
+  <!-- 与已验证 stage1_real_flight.launch 完全相同的 MID360 启动方式 -->
+  <include if="$(arg start_livox)"
+           file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch" />
+
+  <!-- 与已验证 stage1_real_flight.launch 完全相同的 Faster-LIO 启动方式 -->
+  <include if="$(arg start_faster_lio)"
+           file="$(find faster_lio)/launch/rflysim.launch" />
+
+  <!-- D26任务状态机 -->
+  <node pkg="d26_air_ground_uav"
+        type="air_ground_mission_fsm.py"
+        name="air_ground_mission_fsm"
+        output="screen"
+        required="true">
+    <param name="mission_yaml" value="$(arg mission_yaml)" />
+  </node>
+
+
+  <!--
+    无人机端 UDP 接收/状态网关：
+    - 接收 GS 的 BOOT/START/LAND/RESET/PING/STATUS；
+    - ACK、命令去重；DHCP 模式动态学习地面站 IP；
+    - START 前检查 FCU、WAIT_START 和本地定位新鲜度；
+    - 本测试由 real_flight_fake_car 独占 /car/state，因此禁止网关发布真车遥测。
+    网关崩溃时仅重启网关，不结束 FSM/MAVROS，避免飞行中 roslaunch 整体退出。
+  -->
+  <node if="$(arg start_udp_gateway)"
+        pkg="d26_air_ground_uav"
+        type="uav_udp_gateway.py"
+        name="uav_udp_gateway"
+        output="screen"
+        respawn="true"
+        respawn_delay="1.0"
+        clear_params="true">
+    <param name="mission_yaml" value="$(arg mission_yaml)" />
+    <param name="listen_ip" value="$(arg uav_listen_ip)" />
+    <param name="listen_port" value="$(arg uav_listen_port)" />
+    <param name="ground_station_ip" value="$(arg ground_station_ip)" />
+    <param name="ground_station_port" value="$(arg ground_station_port)" />
+    <param name="car_ip" value="$(arg car_ip)" />
+    <param name="strict_source_ip" value="$(arg strict_source_ip)" />
+    <param name="learn_ground_station_ip" value="$(arg learn_ground_station_ip)" />
+    <param name="allow_gs_direct_start" value="$(arg allow_gs_direct_start)" />
+    <param name="allow_legacy_format" value="$(arg allow_legacy_format)" />
+    <param name="forced_task" value="T2" />
+    <param name="car_telemetry_enabled" value="false" />
+    <param name="command_result_timeout_s" value="0.80" />
+    <param name="status_max_age_s" value="0.80" />
+    <param name="start_pose_max_age_s" value="0.30" />
+    <param name="max_packet_bytes" value="4096" />
+  </node>
+
+  <!-- 虚拟小车：任务二仅发布 /car/state；不生成假视觉，禁止对不存在的平台下降 -->
+  <node pkg="d26_air_ground_uav"
+        type="real_flight_fake_car.py"
+        name="real_flight_fake_car"
+        output="screen"
+        required="false"
+        clear_params="true">
+    <param name="mission_yaml" value="$(arg mission_yaml)" />
+    <param name="mission_type" value="dynamic_land" />
+
+    <param name="speed_ab" value="$(arg car_speed_ab)" />
+    <param name="speed_bc" value="$(arg car_speed_bc)" />
+    <param name="speed_cd" value="$(arg car_speed_cd)" />
+    <param name="speed_da" value="$(arg car_speed_da)" />
+    <param name="telemetry_rate_hz" value="$(arg car_telemetry_rate_hz)" />
+    <param name="update_rate_hz" value="$(arg car_update_rate_hz)" />
+    <param name="start_path_s" value="$(arg start_path_s)" />
+    <param name="loop_track" value="false" />
+
+    <param name="auto_run_on_intercept" value="true" />
+    <param name="publish_fake_vision" value="false" />
+    <param name="allow_dynamic_land_fake_vision" value="false" />
+    <param name="max_fake_vision_range_m"
+           value="$(arg max_fake_vision_range_m)" />
+    <param name="abort_on_topic_conflict" value="true" />
+  </node>
+
+</launch>
